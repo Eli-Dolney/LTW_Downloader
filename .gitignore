@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+.python-version
+
+# IDEs/Editors
+.vscode/
+.idea/
+
+# Build & tooling
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+
+# App artifacts
+downloads/
+
