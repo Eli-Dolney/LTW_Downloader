@@ -1,15 +1,42 @@
 import os
+import re
+import json
 import sys
 import threading
 import subprocess
 import tkinter as tk
 from tkinter import filedialog
 from tkinter import ttk
+from urllib.parse import urlparse
 from yt_dlp import YoutubeDL
 
 # ----------------- Save folder -----------------
+CONFIG_PATH = os.path.expanduser("~/.ltw_downloader.json")
+
 save_folder = os.path.join(os.getcwd(), "downloads")
 os.makedirs(save_folder, exist_ok=True)
+
+# State tracked across the session
+cookies_path = ""  # optional cookie file for sites like TikTok
+last_downloaded_path = ""  # absolute path to the most recent file
+URL_PLACEHOLDER = "Paste a video URL (YouTube, TikTok, etc.)"
+url_has_placeholder = True
+
+# Streaming services that are DRM-protected and not supported by yt-dlp
+UNSUPPORTED_DRM_DOMAINS = (
+    "netflix.com",
+    "disneyplus.com",
+    "hulu.com",
+    "primevideo.com",
+    "amazonprimevideo.com",
+    "max.com",  # HBO Max
+    "hbomax.com",
+    "tv.apple.com",
+    "paramountplus.com",
+    "peacocktv.com",
+    "starz.com",
+    "showtime.com",
+)
 
 # ----------------- Helpers -----------------
 def open_folder(path):
@@ -19,6 +46,17 @@ def open_folder(path):
         os.startfile(path)  # type: ignore[attr-defined]
     else:
         subprocess.call(["xdg-open", path])
+
+def reveal_in_finder(path):
+    """Reveal a file in the system file explorer if possible."""
+    if not path:
+        return
+    if sys.platform.startswith("darwin"):
+        subprocess.call(["open", "-R", path])
+    elif os.name == "nt":
+        subprocess.call(["explorer", "/select,", path])
+    else:
+        subprocess.call(["xdg-open", os.path.dirname(path)])
 
 def format_for_video(label):
     """Return a yt-dlp format selector that prefers H.264/AAC MP4 for QuickTime.
@@ -36,11 +74,60 @@ def format_for_video(label):
     fallback2 = f"/best{height_filter}"
     return preferred + fallback1 + fallback2
 
+# ----------------- Settings Persistence -----------------
+def load_settings():
+    global save_folder, cookies_path
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data.get("save_folder"), str) and data.get("save_folder"):
+            save_folder_candidate = data["save_folder"]
+            if os.path.isdir(save_folder_candidate):
+                save_folder = save_folder_candidate
+        if isinstance(data.get("cookies_path"), str):
+            cookies_path = data.get("cookies_path") or ""
+        # Defer UI variable assignment until after widgets are built
+        return data
+    except Exception:
+        return {}
+
+def save_settings(extra: dict | None = None):
+    try:
+        data = {
+            "save_folder": save_folder,
+            "cookies_path": cookies_path,
+            "auto_open": int(auto_open_var.get()) if 'auto_open_var' in globals() else 0,
+            "auto_detect_clipboard": int(auto_detect_clipboard_var.get()) if 'auto_detect_clipboard_var' in globals() else 1,
+            "mode": mode_var.get() if 'mode_var' in globals() else 'audio',
+            "quality": quality_var.get() if 'quality_var' in globals() else 'Best',
+            "playlist": int(playlist_var.get()) if 'playlist_var' in globals() else 0,
+            "subtitles": int(subs_var.get()) if 'subs_var' in globals() else 0,
+        }
+        if extra:
+            data.update(extra)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
 # ----------------- Download -----------------
 def start_download():
+    # Guard placeholder text
     url = url_var.get().strip()
+    if url_has_placeholder or not url:
+        status_var.set("❌ Paste a video URL.")
+        return
     if not url:
-        status_var.set("❌ Paste a YouTube URL.")
+        status_var.set("❌ Paste a video URL.")
+        return
+
+    # Early block for DRM platforms to avoid confusing partial downloads
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except Exception:
+        netloc = ""
+    if any(d in netloc for d in UNSUPPORTED_DRM_DOMAINS):
+        status_var.set("⚠️ This site uses DRM (e.g., Netflix/Disney+/Prime). Full downloads are not supported.")
         return
 
     mode = mode_var.get()
@@ -49,10 +136,22 @@ def start_download():
 
     ydl_opts = {
         "quiet": True,
-        "outtmpl": os.path.join(save_folder, "%(title)s.%(ext)s"),
+        # Prefix filename with platform and uploader for easy attribution
+        # Example: "YouTube - ChannelName - Video Title.mp4"
+        # For TikTok: "TikTok - uploader - Title.mp4"
+        "outtmpl": os.path.join(save_folder, "%(extractor_key)s - %(uploader)s - %(title)s.%(ext)s"),
+        # Use a safe placeholder if some metadata is missing
+        "outtmpl_na_placeholder": "unknown",
         "noplaylist": not allow_playlist,
         "progress_hooks": [progress_hook],
+        # Be resilient to flaky connections
+        "retries": 10,
+        "fragment_retries": 10,
+        "skip_unavailable_fragments": True,
+        "socket_timeout": 20,
     }
+    if cookies_path:
+        ydl_opts["cookiefile"] = cookies_path
 
     if mode == "audio":
         ydl_opts["format"] = "bestaudio/best"
@@ -70,6 +169,12 @@ def start_download():
             "-movflags", "+faststart",  # better playback/start on macOS
             "-pix_fmt", "yuv420p",       # wide compatibility
         ]
+        if subs_var.get() == 1:
+            # Save subtitles alongside and try to embed when possible
+            ydl_opts["writesubtitles"] = True
+            ydl_opts["writeautomaticsub"] = True
+            ydl_opts["subtitlesformat"] = "srt"
+            ydl_opts["embedsubtitles"] = True
 
     toggle_ui(False)
     status_var.set("⬇️ Starting download...")
@@ -84,6 +189,12 @@ def start_download():
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
             status_var.set(f"✅ Done! Saved to:\n{save_folder}")
+            if auto_open_var.get():
+                try:
+                    open_folder(save_folder)
+                except Exception:
+                    pass
+            save_settings()
         except Exception as e:
             status_var.set("❌ Error. Check terminal.")
             print(e)
@@ -101,6 +212,15 @@ def progress_hook(d):
             pct = int(downloaded * 100 / total)
             root.after(0, update_progress, pct, d.get("speed"), d.get("eta"))
     elif d.get("status") in ("finished", "postprocessing"):
+        # Remember the final path when available
+        global last_downloaded_path
+        filename = d.get("filename") or ""
+        if filename:
+            last_downloaded_path = os.path.abspath(filename)
+            try:
+                root.after(0, lambda: open_file_btn.config(state="normal"))
+            except Exception:
+                pass
         root.after(0, update_progress, 100, None, None)
 
 def format_eta(eta_seconds):
@@ -134,7 +254,8 @@ def toggle_ui(state: bool):
     download_btn.config(state=ui_state)
     browse_btn.config(state=ui_state)
     paste_btn.config(state=ui_state)
-    open_btn.config(state=ui_state)
+    # Keep Open Folder available during downloads to reduce confusion
+    open_btn.config(state="normal")
     playlist_check.config(state=ui_state)
     audio_rb.config(state=ui_state)
     video_rb.config(state=ui_state)
@@ -146,6 +267,7 @@ def choose_folder():
     if folder:
         save_folder = folder
         folder_var.set(f"Save to: {save_folder}")
+        save_settings()
 
 def on_mode_change():
     try:
@@ -159,11 +281,64 @@ def paste_from_clipboard():
     except Exception:
         text = ""
     if text:
+        clear_url_placeholder()
         url_var.set(text)
+        status_var.set("📋 Pasted from clipboard.")
+        update_download_btn_state()
+
+def is_probable_url(text: str) -> bool:
+    if not text:
+        return False
+    if text == URL_PLACEHOLDER:
+        return False
+    try:
+        parsed = urlparse(text)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+def maybe_autopaste_url(only_if_empty: bool = True):
+    """If the clipboard holds a URL, prefill the entry.
+
+    When only_if_empty is True, only fill when the entry has no user text.
+    """
+    try:
+        clip = root.clipboard_get().strip()
+    except Exception:
+        return
+    if not is_probable_url(clip):
+        return
+    current = url_var.get().strip()
+    if only_if_empty and (current and not url_has_placeholder):
+        return
+    clear_url_placeholder()
+    url_var.set(clip)
+    status_var.set("🔎 Detected URL from clipboard.")
+    update_download_btn_state()
+
+def update_download_btn_state(*_args):
+    url_text = url_var.get().strip()
+    is_valid = bool(is_probable_url(url_text) and not url_has_placeholder)
+    download_btn.config(state="normal" if is_valid else "disabled")
+
+def clear_url_placeholder(_event=None):
+    global url_has_placeholder
+    if url_has_placeholder:
+        url_entry.delete(0, "end")
+        url_entry.config(fg="#111111")
+        url_has_placeholder = False
+
+def set_url_placeholder():
+    global url_has_placeholder
+    if not url_var.get().strip():
+        url_has_placeholder = True
+        url_entry.delete(0, "end")
+        url_entry.insert(0, URL_PLACEHOLDER)
+        url_entry.config(fg="#777777")
 
 # ----------------- GUI -----------------
 root = tk.Tk()
-root.title("LTW YouTube Downloader")
+root.title("LTW Video Downloader")
 root.geometry("760x520")
 root.resizable(True, True)
 
@@ -191,12 +366,18 @@ percent_var = tk.StringVar(value="0%")
 mode_var = tk.StringVar(value="audio")
 quality_var = tk.StringVar(value="Best")
 playlist_var = tk.IntVar(value=0)
+auto_open_var = tk.IntVar(value=0)
+auto_detect_clipboard_var = tk.IntVar(value=1)
+cookies_label_var = tk.StringVar(value="No cookies loaded")
+subs_var = tk.IntVar(value=0)
 
 # URL Entry
-tk.Label(url_row, text="YouTube URL:", bg=BG, fg=FG, font=FONT_BOLD).grid(row=0, column=0, sticky="w", padx=(0,8))
-url_entry = tk.Entry(url_row, textvariable=url_var, width=60, bg="#ffffff", fg="#111111", insertbackground="#111111", relief="groove")
+tk.Label(url_row, text="Video URL:", bg=BG, fg=FG, font=FONT_BOLD).grid(row=0, column=0, sticky="w", padx=(0,8))
+url_entry = tk.Entry(url_row, textvariable=url_var, width=60, bg="#ffffff", fg="#777777", insertbackground="#111111", relief="groove")
 url_entry.grid(row=0, column=1, sticky="ew")
 url_entry.bind('<Return>', lambda e: start_download())
+url_entry.bind('<FocusIn>', clear_url_placeholder)
+url_entry.bind('<FocusOut>', lambda e: (set_url_placeholder(), update_download_btn_state()))
 url_entry.focus()
 
 paste_btn = tk.Button(url_row, text="Paste", command=paste_from_clipboard)
@@ -232,9 +413,36 @@ if mode_var.get() != "video":
 playlist_check = tk.Checkbutton(frm, text="Download full playlist (if available)", variable=playlist_var, bg=BG, fg=FG, selectcolor=BG, font=FONT_REG)
 playlist_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 14))
 
+# Convenience toggles
+toggles_row = tk.Frame(frm, bg=BG)
+toggles_row.grid(row=4, column=0, columnspan=3, sticky="w")
+auto_detect_cb = tk.Checkbutton(toggles_row, text="Auto-detect URL from clipboard", variable=auto_detect_clipboard_var, bg=BG, fg=FG, selectcolor=BG, font=FONT_REG)
+auto_detect_cb.grid(row=0, column=0, padx=(0, 18))
+auto_open_cb = tk.Checkbutton(toggles_row, text="Open folder when finished", variable=auto_open_var, bg=BG, fg=FG, selectcolor=BG, font=FONT_REG)
+auto_open_cb.grid(row=0, column=1)
+subs_cb = tk.Checkbutton(toggles_row, text="Download subtitles (if available)", variable=subs_var, bg=BG, fg=FG, selectcolor=BG, font=FONT_REG)
+subs_cb.grid(row=0, column=2, padx=(18, 0))
+
+# Cookies loader for sites like TikTok/private videos
+cookies_row = tk.Frame(frm, bg=BG)
+cookies_row.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 6))
+cookies_row.grid_columnconfigure(1, weight=1)
+def load_cookies():
+    global cookies_path
+    path = filedialog.askopenfilename(title="Select cookies.txt", filetypes=[("Cookies file", "*.txt"), ("All files", "*.*")])
+    if path:
+        cookies_path = path
+        cookies_label_var.set(f"Cookies: {os.path.basename(path)}")
+    else:
+        cookies_path = ""
+        cookies_label_var.set("No cookies loaded")
+    save_settings()
+tk.Button(cookies_row, text="Load Cookies...", command=load_cookies).grid(row=0, column=0, sticky="w")
+tk.Label(cookies_row, textvariable=cookies_label_var, bg=BG, fg=FG, font=FONT_REG).grid(row=0, column=1, sticky="w", padx=(8,0))
+
 # Progress (canvas bar)
 progress_frame = tk.Frame(frm, bg=BG)
-progress_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
+progress_frame.grid(row=6, column=0, columnspan=3, sticky="ew")
 progress_bg = "#3a3a3a" if BG == "#2b2b2b" else "#d0d0d0"
 progress_canvas = tk.Canvas(progress_frame, height=20, bg=progress_bg, highlightthickness=1, highlightbackground="#666666")
 progress_canvas.pack(side="left", fill="x", expand=True)
@@ -253,16 +461,35 @@ def set_progress(pct: int):
 
 # Buttons
 button_frame = tk.Frame(frm, bg=BG)
-button_frame.grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 6))
+button_frame.grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 6))
 download_btn = tk.Button(button_frame, text="Download", command=start_download, font=FONT_BOLD)
 download_btn.grid(row=0, column=0)
 open_btn = tk.Button(button_frame, text="Open Folder", command=lambda: open_folder(save_folder), font=FONT_REG)
 open_btn.grid(row=0, column=1, padx=(8, 0))
 
+# Button to reveal the most recent file
+def open_last_file():
+    if last_downloaded_path:
+        reveal_in_finder(last_downloaded_path)
+open_file_btn = tk.Button(button_frame, text="Open File", command=open_last_file, state="disabled", font=FONT_REG)
+open_file_btn.grid(row=0, column=2, padx=(8, 0))
+
+# Quick action: Paste from clipboard and immediately start download
+def paste_and_download():
+    paste_from_clipboard()
+    if download_btn["state"] == "normal":
+        start_download()
+
 # Keyboard shortcut: Cmd+V to paste, Enter to download
 root.bind_all('<Command-v>', lambda e: paste_from_clipboard())
 root.bind_all('<Control-v>', lambda e: paste_from_clipboard())
 root.bind_all('<Return>', lambda e: start_download())
+root.bind_all('<Command-Shift-v>', lambda e: paste_and_download())
+root.bind_all('<Control-Shift-v>', lambda e: paste_and_download())
+def _on_focus_in(_event):
+    if auto_detect_clipboard_var.get() == 1:
+        maybe_autopaste_url(only_if_empty=True)
+root.bind('<FocusIn>', _on_focus_in)
 
 # Status
 status_label = tk.Label(frm, textvariable=status_var, wraplength=600, bg=BG, fg=ACCENT, justify="left", font=FONT_REG)
@@ -286,4 +513,44 @@ root.update_idletasks()
 root.minsize(760, 520)
 progress_canvas.after(150, lambda: set_progress(0))
 
+# Apply persisted settings now that the UI exists
+_loaded = load_settings()
+if _loaded:
+    try:
+        folder_var.set(f"Save to: {save_folder}")
+        if "auto_open" in _loaded:
+            auto_open_var.set(int(_loaded.get("auto_open", 0)))
+        if "auto_detect_clipboard" in _loaded:
+            auto_detect_clipboard_var.set(int(_loaded.get("auto_detect_clipboard", 1)))
+        if "mode" in _loaded:
+            mode_var.set(_loaded.get("mode", "audio"))
+            on_mode_change()
+        if "quality" in _loaded:
+            quality_var.set(_loaded.get("quality", "Best"))
+        if "playlist" in _loaded:
+            playlist_var.set(int(_loaded.get("playlist", 0)))
+        if "subtitles" in _loaded:
+            subs_var.set(int(_loaded.get("subtitles", 0)))
+        if cookies_path:
+            cookies_label_var.set(f"Cookies: {os.path.basename(cookies_path)}")
+    except Exception:
+        pass
+
+# Save settings whenever key toggles change
+auto_open_cb.config(command=lambda: save_settings())
+auto_detect_cb.config(command=lambda: save_settings())
+audio_rb.config(command=lambda: (on_mode_change(), save_settings()))
+video_rb.config(command=lambda: (on_mode_change(), save_settings()))
+quality_menu.config(command=lambda *_: save_settings())
+playlist_check.config(command=lambda: save_settings())
+
+def on_close():
+    save_settings()
+    try:
+        root.destroy()
+    except Exception:
+        pass
+root.protocol("WM_DELETE_WINDOW", on_close)
+
 root.mainloop()
+
