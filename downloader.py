@@ -9,6 +9,8 @@ from tkinter import filedialog
 from tkinter import ttk
 from urllib.parse import urlparse
 from yt_dlp import YoutubeDL
+import html
+import warnings
 
 # ----------------- Save folder -----------------
 CONFIG_PATH = os.path.expanduser("~/.ltw_downloader.json")
@@ -67,9 +69,9 @@ def format_for_video(label):
     height_caps = {"Best": None, "1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
     h = height_caps.get(label)
     height_filter = f"[height<={h}]" if h else ""
-    # Prefer separate best video/audio that are already MP4/H.264 + M4A/AAC
-    preferred = f"bestvideo[ext=mp4][vcodec*=avc]{height_filter}+bestaudio[ext=m4a][acodec*=mp4a]"
-    # Fallback to a single MP4 if available, then anything else as last resort
+    # More flexible format selection that works with current YouTube formats
+    preferred = f"bestvideo[ext=mp4]{height_filter}+bestaudio[ext=m4a]"
+    # Fallback to any MP4, then any format
     fallback1 = f"/best[ext=mp4]{height_filter}"
     fallback2 = f"/best{height_filter}"
     return preferred + fallback1 + fallback2
@@ -91,7 +93,7 @@ def load_settings():
     except Exception:
         return {}
 
-def save_settings(extra: dict | None = None):
+def save_settings(extra = None):
     try:
         data = {
             "save_folder": save_folder,
@@ -111,6 +113,83 @@ def save_settings(extra: dict | None = None):
         pass
 
 # ----------------- Download -----------------
+def _safe_component(name: str) -> str:
+    """Return a filesystem-safe folder/file component."""
+    if not isinstance(name, str):
+        name = str(name)
+    # Replace invalid filename characters on major OSes
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    # Strip leading/trailing whitespace and dots
+    name = name.strip().strip(".")
+    # Collapse duplicate underscores/spaces
+    name = re.sub(r"[\s_]+", " ", name).strip()
+    return name or "unknown"
+
+
+def _srt_to_plain_text(srt_content: str) -> str:
+    """Convert SRT content to plain text by removing indices, timestamps, and markup."""
+    # Normalize line endings
+    text = srt_content.replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for raw in text.split("\n"):
+        line = raw.strip("\ufeff ")  # remove BOM and trim spaces
+        # Skip index lines (a single number) and timestamp lines
+        if re.fullmatch(r"\d+", line):
+            continue
+        if "-->" in line:
+            continue
+        # Remove simple HTML tags often present in subtitles
+        line = re.sub(r"<[^>]+>", "", line)
+        # Unescape HTML entities
+        line = html.unescape(line)
+        lines.append(line)
+
+    # Collapse blocks separated by blank lines; join lines within a block with spaces
+    paragraphs = []
+    block = []
+    for line in lines:
+        if line:
+            block.append(line)
+        else:
+            if block:
+                paragraphs.append(" ".join(block))
+                block = []
+    if block:
+        paragraphs.append(" ".join(block))
+    # Join paragraphs with blank line between
+    return "\n\n".join(p.strip() for p in paragraphs if p.strip())
+
+
+def _convert_srt_file_to_txt(srt_path: str):
+    """Create a .txt transcript next to the .srt file. Returns txt path or None on failure."""
+    try:
+        with open(srt_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        plain = _srt_to_plain_text(content)
+        txt_path = os.path.splitext(srt_path)[0] + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(plain.strip() + "\n")
+        return txt_path
+    except Exception:
+        return None
+
+
+def _convert_srts_in_directory(base_dir: str):
+    """Find all .srt files in base_dir and ensure a fresh .txt transcript exists next to each."""
+    for root_dir, _dirs, files in os.walk(base_dir):
+        for filename in files:
+            if not filename.lower().endswith(".srt"):
+                continue
+            srt_path = os.path.join(root_dir, filename)
+            txt_path = os.path.splitext(srt_path)[0] + ".txt"
+            try:
+                if not os.path.exists(txt_path) or os.path.getmtime(txt_path) < os.path.getmtime(srt_path):
+                    _convert_srt_file_to_txt(srt_path)
+            except Exception:
+                # Best-effort conversion; ignore failures
+                pass
+
+
 def start_download():
     # Guard placeholder text
     url = url_var.get().strip()
@@ -120,6 +199,9 @@ def start_download():
     if not url:
         status_var.set("❌ Paste a video URL.")
         return
+    
+    # Suppress impersonation warnings
+    warnings.filterwarnings("ignore", message=".*impersonation.*")
 
     # Early block for DRM platforms to avoid confusing partial downloads
     try:
@@ -134,12 +216,9 @@ def start_download():
     quality = quality_var.get()
     allow_playlist = playlist_var.get()
 
+    # Base options; output template is finalized inside the worker after probing
     ydl_opts = {
         "quiet": True,
-        # Prefix filename with platform and uploader for easy attribution
-        # Example: "YouTube - ChannelName - Video Title.mp4"
-        # For TikTok: "TikTok - uploader - Title.mp4"
-        "outtmpl": os.path.join(save_folder, "%(extractor_key)s - %(uploader)s - %(title)s.%(ext)s"),
         # Use a safe placeholder if some metadata is missing
         "outtmpl_na_placeholder": "unknown",
         "noplaylist": not allow_playlist,
@@ -149,12 +228,28 @@ def start_download():
         "fragment_retries": 10,
         "skip_unavailable_fragments": True,
         "socket_timeout": 20,
+        # Better handling of HLS streams (SoundCloud, etc.)
+        "hls_use_mpegts": False,
+        "hls_prefer_native": False,
+        "external_downloader": None,
+        "external_downloader_args": None,
+        # Suppress impersonation warnings (not critical for functionality)
+        "no_warnings": False,
+        # Continue playlist even if some entries fail and prefer mobile clients for YT Music quirks
+        "ignoreerrors": "only_download",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web"],
+            }
+        },
     }
     if cookies_path:
         ydl_opts["cookiefile"] = cookies_path
 
     if mode == "audio":
         ydl_opts["format"] = "bestaudio/best"
+        # Ensure proper merging of HLS segments for SoundCloud
+        ydl_opts["merge_output_format"] = "m4a"
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -169,12 +264,14 @@ def start_download():
             "-movflags", "+faststart",  # better playback/start on macOS
             "-pix_fmt", "yuv420p",       # wide compatibility
         ]
-        if subs_var.get() == 1:
-            # Save subtitles alongside and try to embed when possible
-            ydl_opts["writesubtitles"] = True
-            ydl_opts["writeautomaticsub"] = True
-            ydl_opts["subtitlesformat"] = "srt"
-            ydl_opts["embedsubtitles"] = True
+
+    # Always download transcripts/subtitles when available
+    ydl_opts["writesubtitles"] = True
+    ydl_opts["writeautomaticsub"] = True
+    ydl_opts["subtitlesformat"] = "srt"
+    if mode == "video":
+        # Also embed into MP4 when possible (external .srt will still be saved)
+        ydl_opts["embedsubtitles"] = True
 
     toggle_ui(False)
     status_var.set("⬇️ Starting download...")
@@ -186,8 +283,44 @@ def start_download():
 
     def run_download():
         try:
+            # First, probe the URL to determine if it's a playlist and get the title
+            playlist_title = None
+            is_playlist = False
+            try:
+                probe_opts = {"quiet": True, "noplaylist": False}
+                if cookies_path:
+                    probe_opts["cookiefile"] = cookies_path
+                with YoutubeDL(probe_opts) as probe:
+                    info = probe.extract_info(url, download=False)
+                    # yt-dlp returns a dict with _type for playlists
+                    is_playlist = isinstance(info, dict) and info.get("_type") in ("playlist", "multi_video")
+                    if is_playlist:
+                        playlist_title = info.get("title") or info.get("playlist_title")
+            except Exception:
+                pass
+
+            # Finalize output template: ensure per-video folders and optional playlist folder
+            target_root_dir = save_folder
+            if allow_playlist and is_playlist and playlist_title:
+                # Use custom folder name "eli" for playlist downloads
+                pl_dir = os.path.join(save_folder, "eli")
+                outtmpl = os.path.join(pl_dir, "%(title)s [%(id)s]", "%(title)s [%(id)s].%(ext)s")
+                ydl_opts["noplaylist"] = False
+                target_root_dir = pl_dir
+            else:
+                outtmpl = os.path.join(save_folder, "%(title)s [%(id)s]", "%(title)s [%(id)s].%(ext)s")
+                ydl_opts["noplaylist"] = True if not allow_playlist else ydl_opts.get("noplaylist", True)
+                target_root_dir = save_folder
+
+            ydl_opts["outtmpl"] = outtmpl
+
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
+            # After download, convert any SRTs found to clean TXT for easy reading
+            try:
+                _convert_srts_in_directory(target_root_dir)
+            except Exception:
+                pass
             status_var.set(f"✅ Done! Saved to:\n{save_folder}")
             if auto_open_var.get():
                 try:
@@ -369,7 +502,7 @@ playlist_var = tk.IntVar(value=0)
 auto_open_var = tk.IntVar(value=0)
 auto_detect_clipboard_var = tk.IntVar(value=1)
 cookies_label_var = tk.StringVar(value="No cookies loaded")
-subs_var = tk.IntVar(value=0)
+subs_var = tk.IntVar(value=1)
 
 # URL Entry
 tk.Label(url_row, text="Video URL:", bg=BG, fg=FG, font=FONT_BOLD).grid(row=0, column=0, sticky="w", padx=(0,8))
@@ -422,6 +555,10 @@ auto_open_cb = tk.Checkbutton(toggles_row, text="Open folder when finished", var
 auto_open_cb.grid(row=0, column=1)
 subs_cb = tk.Checkbutton(toggles_row, text="Download subtitles (if available)", variable=subs_var, bg=BG, fg=FG, selectcolor=BG, font=FONT_REG)
 subs_cb.grid(row=0, column=2, padx=(18, 0))
+try:
+    subs_cb.config(state="disabled")
+except Exception:
+    pass
 
 # Cookies loader for sites like TikTok/private videos
 cookies_row = tk.Frame(frm, bg=BG)
@@ -530,7 +667,7 @@ if _loaded:
         if "playlist" in _loaded:
             playlist_var.set(int(_loaded.get("playlist", 0)))
         if "subtitles" in _loaded:
-            subs_var.set(int(_loaded.get("subtitles", 0)))
+            subs_var.set(1)  # force on by default now
         if cookies_path:
             cookies_label_var.set(f"Cookies: {os.path.basename(cookies_path)}")
     except Exception:
@@ -541,8 +678,17 @@ auto_open_cb.config(command=lambda: save_settings())
 auto_detect_cb.config(command=lambda: save_settings())
 audio_rb.config(command=lambda: (on_mode_change(), save_settings()))
 video_rb.config(command=lambda: (on_mode_change(), save_settings()))
-quality_menu.config(command=lambda *_: save_settings())
 playlist_check.config(command=lambda: save_settings())
+
+# Tk's OptionMenu on macOS system Tk may not support setting a command via config.
+# Instead, observe the variable and save when it changes.
+try:
+    quality_var.trace_add("write", lambda *_: save_settings())
+except Exception:
+    try:
+        quality_var.trace("w", lambda *_: save_settings())
+    except Exception:
+        pass
 
 def on_close():
     save_settings()

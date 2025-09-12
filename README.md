@@ -18,6 +18,7 @@ A tiny desktop app to download audio (MP3) or video (MP4) from sites supported b
 - **Optional subtitles** download/embedding (SRT when available)
 - **Persistent settings** in `~/.ltw_downloader.json`
 - **Cmd+Shift+V / Ctrl+Shift+V**: Paste from clipboard and start download immediately
+- **SoundCloud support** with proper HLS segment merging
 
 ## Requirements
 
@@ -117,6 +118,10 @@ Use the **Load Cookies…** button to select a `cookies.txt` exported from your 
 - **FFmpeg not found**: Install it (see Requirements) and make sure it’s on your PATH. Verify with `ffmpeg -version`.
 
 - **DRM streaming (Netflix, Disney+, Prime, etc.)**: Not supported. The app blocks these early; partial previews may be unencrypted, but full streams are protected.
+- **SoundCloud split files**: If you get `.part` files from SoundCloud, run `python3 merge_soundcloud.py` to merge them. The updated downloader should prevent this issue.
+- **Format not available errors**: If you see "Requested format is not available" errors, try updating yt-dlp: `python3 -m pip install --upgrade yt-dlp`
+- **Python 3.9 deprecation warning**: You may see a warning about Python 3.9 being deprecated. This is harmless but consider upgrading to Python 3.10+ for future compatibility.
+- **Impersonation warning**: You may see a warning about impersonation dependencies. This is harmless and downloads will still work. The warning is automatically suppressed in the app.
 
 ## Security & Privacy
 
